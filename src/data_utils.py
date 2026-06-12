@@ -1,8 +1,11 @@
 """
 data_utils.py
 ─────────────
-Fix: pixel_values selalu 4D [tiles/batch, C, H, W]
-     Tidak pernah squeeze ke 3D
+Fix:
+  - Skip sample dengan valid tokens < 10 (mencegah loss NaN)
+  - pixel_values list dari PixtralProcessor di-normalize ke tensor 4D
+  - __getitem__ iteratif (tidak rekursif)
+  - Fallback manual Mistral [INST]...[/INST]
 """
 
 import json
@@ -15,6 +18,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+# Minimum token assistant yang harus ada agar sample dipakai training
+MIN_VALID_TOKENS = 10
 
 
 class DFKDataset(Dataset):
@@ -48,6 +54,8 @@ class DFKDataset(Dataset):
                 if line:
                     self.samples.append(json.loads(line))
 
+    # ── Image helpers ─────────────────────────────────────────────────────────
+
     def _collect_images(self, messages: List[Dict]) -> List[Image.Image]:
         images: List[Image.Image] = []
         for msg in messages:
@@ -67,6 +75,8 @@ class DFKDataset(Dataset):
                     except Exception as e:
                         logger.debug("Cannot open image %s: %s", full, e)
         return images
+
+    # ── Text formatting ───────────────────────────────────────────────────────
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -141,16 +151,18 @@ class DFKDataset(Dataset):
         prompt_text = f"{bos}[INST] {user_part} [/INST] "
         return full_text, prompt_text
 
+    # ── Pixel values helpers ──────────────────────────────────────────────────
+
     @staticmethod
     def _normalize_pixel_values(pixel_values: Any) -> Optional[torch.Tensor]:
         """
         Normalize pixel_values ke 4D tensor [tiles/batch, C, H, W].
-        PENTING: Tidak pernah squeeze ke 3D — menyebabkan shape mismatch di Pixtral.
+        PixtralProcessor return list of tensors untuk dynamic resolution.
+        PENTING: Tidak pernah squeeze ke 3D.
         """
         if pixel_values is None:
             return None
 
-        # Handle list (PixtralProcessor return list untuk dynamic resolution)
         if isinstance(pixel_values, (list, tuple)):
             if not pixel_values:
                 return None
@@ -158,31 +170,24 @@ class DFKDataset(Dataset):
                 pixel_values = pixel_values[0]
             else:
                 try:
-                    # Pastikan tiap elemen minimal 4D sebelum cat
                     tensors = []
                     for p in pixel_values:
                         if isinstance(p, torch.Tensor):
                             if p.dim() == 3:
                                 p = p.unsqueeze(0)
                             tensors.append(p)
-                    if tensors:
-                        pixel_values = torch.cat(tensors, dim=0)
-                    else:
-                        return None
+                    pixel_values = torch.cat(tensors, dim=0) if tensors else None
                 except Exception:
                     pixel_values = pixel_values[0]
 
         if not isinstance(pixel_values, torch.Tensor):
             return None
 
-        # Pastikan minimal 4D — JANGAN squeeze ke 3D
+        # Pastikan 4D — JANGAN squeeze ke 3D
         if pixel_values.dim() == 3:
-            # [C, H, W] → [1, C, H, W]
-            pixel_values = pixel_values.unsqueeze(0)
+            pixel_values = pixel_values.unsqueeze(0)   # [C,H,W] → [1,C,H,W]
         elif pixel_values.dim() == 5:
-            # [1, tiles, C, H, W] → [tiles, C, H, W]
-            pixel_values = pixel_values.squeeze(0)
-        # 4D [tiles/batch, C, H, W] → biarkan as-is
+            pixel_values = pixel_values.squeeze(0)     # [1,t,C,H,W] → [t,C,H,W]
 
         return pixel_values
 
@@ -201,7 +206,7 @@ class DFKDataset(Dataset):
                     if s.dim() == 0:
                         s = s.unsqueeze(0)
                     if s.dim() == 1:
-                        s = s.unsqueeze(0)  # [2] → [1, 2]
+                        s = s.unsqueeze(0)
                     tensors.append(s)
             if not tensors:
                 return None
@@ -216,9 +221,11 @@ class DFKDataset(Dataset):
         if image_sizes.dim() == 0:
             image_sizes = image_sizes.unsqueeze(0).unsqueeze(0)
         elif image_sizes.dim() == 1:
-            image_sizes = image_sizes.unsqueeze(0)  # [2] → [1, 2]
+            image_sizes = image_sizes.unsqueeze(0)
 
         return image_sizes
+
+    # ── Encoding ──────────────────────────────────────────────────────────────
 
     def _encode(
         self, messages: List[Dict], images: List[Image.Image]
@@ -238,8 +245,10 @@ class DFKDataset(Dataset):
 
         try:
             if has_images:
-                full_enc   = self.processor(text=full_text,   images=images, **proc_kwargs)
-                prompt_enc = self.processor(text=prompt_text, images=images, return_tensors="pt")
+                full_enc   = self.processor(
+                    text=full_text, images=images, **proc_kwargs)
+                prompt_enc = self.processor(
+                    text=prompt_text, images=images, return_tensors="pt")
             else:
                 full_enc   = self._tok(full_text,   **proc_kwargs)
                 prompt_enc = self._tok(prompt_text, return_tensors="pt")
@@ -255,6 +264,17 @@ class DFKDataset(Dataset):
             labels[:min(prompt_len, len(labels))] = -100
         except Exception as e:
             logger.debug("Label masking failed: %s", e)
+            return None
+
+        # ── FIX UTAMA: Skip sample dengan valid tokens terlalu sedikit ────────
+        # Terjadi ketika teks terlalu panjang sehingga assistant response
+        # terpotong oleh max_seq_length — semua labels = -100, loss = NaN
+        valid_tokens = (labels != -100).sum().item()
+        if valid_tokens < MIN_VALID_TOKENS:
+            logger.debug(
+                "Skip sample: valid tokens=%d < %d (teks terlalu panjang/terpotong)",
+                valid_tokens, MIN_VALID_TOKENS
+            )
             return None
 
         result: Dict[str, torch.Tensor] = {
@@ -282,6 +302,8 @@ class DFKDataset(Dataset):
             "labels":         torch.full((seq,), -100, dtype=torch.long),
         }
 
+    # ── Dataset interface ─────────────────────────────────────────────────────
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -295,6 +317,7 @@ class DFKDataset(Dataset):
             result   = self._encode(messages, images)
             if result is not None:
                 return result
+
         logger.error("Semua sample gagal — return dummy")
         return self._dummy_sample()
 
@@ -312,13 +335,16 @@ class DFKDataCollator:
         for f in features:
             pad = max_len - f["input_ids"].shape[0]
             ids_list.append(torch.cat([
-                torch.full((pad,), self.pad_token_id, dtype=torch.long), f["input_ids"]
+                torch.full((pad,), self.pad_token_id, dtype=torch.long),
+                f["input_ids"]
             ]))
             attn_list.append(torch.cat([
-                torch.zeros(pad, dtype=torch.long), f["attention_mask"]
+                torch.zeros(pad, dtype=torch.long),
+                f["attention_mask"]
             ]))
             lbl_list.append(torch.cat([
-                torch.full((pad,), self.label_pad_id, dtype=torch.long), f["labels"]
+                torch.full((pad,), self.label_pad_id, dtype=torch.long),
+                f["labels"]
             ]))
 
         batch: Dict[str, Any] = {
