@@ -13,6 +13,43 @@ from transformers import Trainer, TrainingArguments
 logger = logging.getLogger(__name__)
 
 
+class DFKTrainer(Trainer):
+    """
+    Custom Trainer yang handle pixel_values berbentuk list.
+    Terjadi ketika gambar punya ukuran berbeda-beda (dynamic resolution).
+    """
+
+    def _prepare_inputs(self, inputs: dict) -> dict:
+        # Pisahkan dulu karena tidak bisa di-.to(device) langsung kalau list
+        pixel_values = inputs.pop("pixel_values", None)
+        image_sizes  = inputs.pop("image_sizes", None)
+
+        # Move tensor lainnya ke device seperti biasa
+        inputs = super()._prepare_inputs(inputs)
+
+        # Handle pixel_values
+        if pixel_values is not None:
+            if isinstance(pixel_values, list):
+                inputs["pixel_values"] = [
+                    pv.to(self.args.device) if hasattr(pv, "to") else pv
+                    for pv in pixel_values
+                ]
+            else:
+                inputs["pixel_values"] = pixel_values.to(self.args.device)
+
+        # Handle image_sizes
+        if image_sizes is not None:
+            if isinstance(image_sizes, list):
+                inputs["image_sizes"] = [
+                    s.to(self.args.device) if hasattr(s, "to") else s
+                    for s in image_sizes
+                ]
+            else:
+                inputs["image_sizes"] = image_sizes.to(self.args.device)
+
+        return inputs
+
+
 def build_training_args(
     train_cfg: dict,
     output_dir: str,
@@ -93,7 +130,7 @@ def build_trainer(
                 training_args.per_device_train_batch_size *
                 training_args.gradient_accumulation_steps)
 
-    return Trainer(
+    return DFKTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
