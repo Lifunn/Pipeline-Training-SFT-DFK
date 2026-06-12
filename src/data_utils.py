@@ -1,13 +1,8 @@
 """
 data_utils.py
 ─────────────
-Dataset dan DataCollator untuk SFT multimodal DFK.
-
-Fix:
-  - __getitem__ iteratif (tidak rekursif)
-  - Fallback manual Mistral [INST]...[/INST]
-  - Handle pixel_values list dari PixtralProcessor
-  - Fix IndexError: invalid index of a 0-dim tensor pada image_sizes
+Fix: pixel_values selalu 4D [tiles/batch, C, H, W]
+     Tidak pernah squeeze ke 3D
 """
 
 import json
@@ -53,8 +48,6 @@ class DFKDataset(Dataset):
                 if line:
                     self.samples.append(json.loads(line))
 
-    # ── Image helpers ─────────────────────────────────────────────────────────
-
     def _collect_images(self, messages: List[Dict]) -> List[Image.Image]:
         images: List[Image.Image] = []
         for msg in messages:
@@ -74,8 +67,6 @@ class DFKDataset(Dataset):
                     except Exception as e:
                         logger.debug("Cannot open image %s: %s", full, e)
         return images
-
-    # ── Text formatting ───────────────────────────────────────────────────────
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -119,7 +110,6 @@ class DFKDataset(Dataset):
     def _build_texts(self, messages: List[Dict]) -> Tuple[str, str]:
         formatted      = self._to_processor_messages(messages)
         prompt_msgs, _ = self._split_prompt(formatted)
-
         try:
             full_text   = self._tok.apply_chat_template(
                 formatted, tokenize=False, add_generation_prompt=False
@@ -130,7 +120,6 @@ class DFKDataset(Dataset):
             return full_text, prompt_text
         except Exception:
             pass
-
         return self._manual_mistral_format(messages)
 
     def _manual_mistral_format(self, messages: List[Dict]) -> Tuple[str, str]:
@@ -148,81 +137,88 @@ class DFKDataset(Dataset):
         user_part = f"{system_text}\n\n{user_text}".strip() if system_text else user_text
         bos = getattr(self._tok, "bos_token", "<s>") or "<s>"
         eos = getattr(self._tok, "eos_token", "</s>") or "</s>"
-
         full_text   = f"{bos}[INST] {user_part} [/INST] {asst_text}{eos}"
         prompt_text = f"{bos}[INST] {user_part} [/INST] "
         return full_text, prompt_text
 
-    # ── Pixel values helper ───────────────────────────────────────────────────
-
     @staticmethod
     def _normalize_pixel_values(pixel_values: Any) -> Optional[torch.Tensor]:
         """
-        PixtralProcessor return pixel_values sebagai list of tensors.
-        Normalize ke single tensor.
+        Normalize pixel_values ke 4D tensor [tiles/batch, C, H, W].
+        PENTING: Tidak pernah squeeze ke 3D — menyebabkan shape mismatch di Pixtral.
         """
         if pixel_values is None:
             return None
+
+        # Handle list (PixtralProcessor return list untuk dynamic resolution)
         if isinstance(pixel_values, (list, tuple)):
-            if len(pixel_values) == 0:
+            if not pixel_values:
                 return None
             if len(pixel_values) == 1:
                 pixel_values = pixel_values[0]
             else:
                 try:
-                    pixel_values = torch.cat(pixel_values, dim=0)
+                    # Pastikan tiap elemen minimal 4D sebelum cat
+                    tensors = []
+                    for p in pixel_values:
+                        if isinstance(p, torch.Tensor):
+                            if p.dim() == 3:
+                                p = p.unsqueeze(0)
+                            tensors.append(p)
+                    if tensors:
+                        pixel_values = torch.cat(tensors, dim=0)
+                    else:
+                        return None
                 except Exception:
                     pixel_values = pixel_values[0]
+
         if not isinstance(pixel_values, torch.Tensor):
             return None
-        if pixel_values.dim() == 4:
+
+        # Pastikan minimal 4D — JANGAN squeeze ke 3D
+        if pixel_values.dim() == 3:
+            # [C, H, W] → [1, C, H, W]
+            pixel_values = pixel_values.unsqueeze(0)
+        elif pixel_values.dim() == 5:
+            # [1, tiles, C, H, W] → [tiles, C, H, W]
             pixel_values = pixel_values.squeeze(0)
+        # 4D [tiles/batch, C, H, W] → biarkan as-is
+
         return pixel_values
 
     @staticmethod
     def _normalize_image_sizes(image_sizes: Any) -> Optional[torch.Tensor]:
-        """
-        FIX: Pastikan image_sizes selalu minimal 1D tensor [H, W].
-        PixtralProcessor kadang return scalar tensor (0-dim) yang
-        menyebabkan IndexError saat di-index dengan [0] di modeling_pixtral.py.
-        """
+        """Normalize image_sizes ke 2D tensor [num_images, 2]."""
         if image_sizes is None:
             return None
 
         if isinstance(image_sizes, (list, tuple)):
-            if len(image_sizes) == 0:
+            if not image_sizes:
                 return None
             tensors = []
             for s in image_sizes:
                 if isinstance(s, torch.Tensor):
-                    # Scalar (0-dim) → pastikan jadi minimal 1D
                     if s.dim() == 0:
                         s = s.unsqueeze(0)
+                    if s.dim() == 1:
+                        s = s.unsqueeze(0)  # [2] → [1, 2]
                     tensors.append(s)
             if not tensors:
                 return None
-            if len(tensors) == 1:
+            try:
+                image_sizes = torch.cat(tensors, dim=0)
+            except Exception:
                 image_sizes = tensors[0]
-            else:
-                try:
-                    image_sizes = torch.stack(tensors)
-                except Exception:
-                    image_sizes = tensors[0]
 
         if not isinstance(image_sizes, torch.Tensor):
             return None
 
-        # Scalar (0-dim) → 1D
         if image_sizes.dim() == 0:
-            image_sizes = image_sizes.unsqueeze(0)
-
-        # Lebih dari 2D → squeeze dimensi pertama
-        if image_sizes.dim() > 2:
-            image_sizes = image_sizes.squeeze(0)
+            image_sizes = image_sizes.unsqueeze(0).unsqueeze(0)
+        elif image_sizes.dim() == 1:
+            image_sizes = image_sizes.unsqueeze(0)  # [2] → [1, 2]
 
         return image_sizes
-
-    # ── Encoding ──────────────────────────────────────────────────────────────
 
     def _encode(
         self, messages: List[Dict], images: List[Image.Image]
@@ -267,7 +263,6 @@ class DFKDataset(Dataset):
             "labels":         labels,
         }
 
-        # Handle pixel_values — PixtralProcessor bisa return list
         pv = self._normalize_pixel_values(full_enc.get("pixel_values"))
         if pv is not None:
             result["pixel_values"] = pv
@@ -287,8 +282,6 @@ class DFKDataset(Dataset):
             "labels":         torch.full((seq,), -100, dtype=torch.long),
         }
 
-    # ── Dataset interface ─────────────────────────────────────────────────────
-
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -302,7 +295,6 @@ class DFKDataset(Dataset):
             result   = self._encode(messages, images)
             if result is not None:
                 return result
-
         logger.error("Semua sample gagal — return dummy")
         return self._dummy_sample()
 
@@ -335,29 +327,25 @@ class DFKDataCollator:
             "labels":         torch.stack(lbl_list),
         }
 
+        # pixel_values: cat along dim=0 (tiles/batch dim)
         pv = [f["pixel_values"] for f in features if "pixel_values" in f]
         if pv:
             if len(pv) == 1:
                 batch["pixel_values"] = pv[0]
             else:
                 try:
-                    batch["pixel_values"] = torch.stack(pv)
+                    batch["pixel_values"] = torch.cat(pv, dim=0)
                 except RuntimeError:
-                    try:
-                        batch["pixel_values"] = torch.cat(pv, dim=0)
-                    except RuntimeError:
-                        batch["pixel_values"] = pv[0]
+                    batch["pixel_values"] = pv[0]
 
-        # FIX: Pastikan semua image_sizes minimal 1D sebelum stack
+        # image_sizes: cat along dim=0
         isz = [f["image_sizes"] for f in features if "image_sizes" in f]
         if isz:
-            # Ensure setiap elemen minimal 1D (fix 0-dim scalar tensor)
-            isz = [s.unsqueeze(0) if s.dim() == 0 else s for s in isz]
             if len(isz) == 1:
                 batch["image_sizes"] = isz[0]
             else:
                 try:
-                    batch["image_sizes"] = torch.stack(isz)
+                    batch["image_sizes"] = torch.cat(isz, dim=0)
                 except RuntimeError:
                     batch["image_sizes"] = isz[0]
 
