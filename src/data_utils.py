@@ -273,16 +273,27 @@ class DFKDataCollator:
 
         pv = [f["pixel_values"] for f in features if "pixel_values" in f]
         if pv:
-            try:
-                batch["pixel_values"] = torch.stack(pv)
-            except RuntimeError:
-                batch["pixel_values"] = pv
+            if len(pv) == 1:
+                # batch_size=1: langsung pakai tensor tanpa tambah batch dim
+                batch["pixel_values"] = pv[0]
+            else:
+                try:
+                    batch["pixel_values"] = torch.stack(pv)
+                except RuntimeError:
+                    # Variable size — concat patches untuk Pixtral
+                    try:
+                        batch["pixel_values"] = torch.cat(pv, dim=0)
+                    except RuntimeError:
+                        batch["pixel_values"] = pv
 
         isz = [f["image_sizes"] for f in features if "image_sizes" in f]
         if isz:
-            try:
-                batch["image_sizes"] = torch.stack(isz)
-            except RuntimeError:
-                batch["image_sizes"] = isz
+            if len(isz) == 1:
+                batch["image_sizes"] = isz[0]
+            else:
+                try:
+                    batch["image_sizes"] = torch.stack(isz)
+                except RuntimeError:
+                    batch["image_sizes"] = isz
 
         return batch
