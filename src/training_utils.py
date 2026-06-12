@@ -8,6 +8,7 @@ import logging
 import os
 from typing import Any, Optional
 
+import torch
 from transformers import Trainer, TrainingArguments
 
 logger = logging.getLogger(__name__)
@@ -15,37 +16,46 @@ logger = logging.getLogger(__name__)
 
 class DFKTrainer(Trainer):
     """
-    Custom Trainer yang handle pixel_values berbentuk list.
-    Terjadi ketika gambar punya ukuran berbeda-beda (dynamic resolution).
+    Custom Trainer untuk Pixtral/Mistral3 VLM.
+    Handle pixel_values yang berbentuk list atau tensor dengan ukuran berbeda.
     """
 
     def _prepare_inputs(self, inputs: dict) -> dict:
-        # Pisahkan dulu karena tidak bisa di-.to(device) langsung kalau list
         pixel_values = inputs.pop("pixel_values", None)
         image_sizes  = inputs.pop("image_sizes", None)
 
-        # Move tensor lainnya ke device seperti biasa
+        # Move semua tensor lain ke device
         inputs = super()._prepare_inputs(inputs)
 
         # Handle pixel_values
         if pixel_values is not None:
-            if isinstance(pixel_values, list):
-                inputs["pixel_values"] = [
-                    pv.to(self.args.device) if hasattr(pv, "to") else pv
+            if isinstance(pixel_values, torch.Tensor):
+                inputs["pixel_values"] = pixel_values.to(self.args.device)
+            elif isinstance(pixel_values, (list, tuple)):
+                moved = [
+                    pv.to(self.args.device) if isinstance(pv, torch.Tensor) else pv
                     for pv in pixel_values
                 ]
-            else:
-                inputs["pixel_values"] = pixel_values.to(self.args.device)
+                if len(moved) == 1:
+                    # batch_size=1: unwrap list → tensor langsung
+                    inputs["pixel_values"] = moved[0]
+                else:
+                    # batch > 1: coba cat patches (Pixtral dynamic resolution)
+                    try:
+                        inputs["pixel_values"] = torch.cat(moved, dim=0)
+                    except RuntimeError:
+                        inputs["pixel_values"] = moved
 
         # Handle image_sizes
         if image_sizes is not None:
-            if isinstance(image_sizes, list):
-                inputs["image_sizes"] = [
-                    s.to(self.args.device) if hasattr(s, "to") else s
+            if isinstance(image_sizes, torch.Tensor):
+                inputs["image_sizes"] = image_sizes.to(self.args.device)
+            elif isinstance(image_sizes, (list, tuple)):
+                moved = [
+                    s.to(self.args.device) if isinstance(s, torch.Tensor) else s
                     for s in image_sizes
                 ]
-            else:
-                inputs["image_sizes"] = image_sizes.to(self.args.device)
+                inputs["image_sizes"] = moved[0] if len(moved) == 1 else moved
 
         return inputs
 
