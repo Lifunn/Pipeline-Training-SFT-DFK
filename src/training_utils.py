@@ -1,9 +1,6 @@
 """
 training_utils.py
-─────────────────
-Build TrainingArguments dan Trainer.
 """
-
 import logging
 import os
 from typing import Any, Optional
@@ -17,45 +14,40 @@ logger = logging.getLogger(__name__)
 class DFKTrainer(Trainer):
     """
     Custom Trainer untuk Pixtral/Mistral3 VLM.
-    Handle pixel_values yang berbentuk list atau tensor dengan ukuran berbeda.
+    Memastikan pixel_values selalu tensor 4D saat dipindah ke device.
     """
 
     def _prepare_inputs(self, inputs: dict) -> dict:
-        pixel_values = inputs.pop("pixel_values", None)
-        image_sizes  = inputs.pop("image_sizes", None)
+        pv  = inputs.pop("pixel_values", None)
+        isz = inputs.pop("image_sizes", None)
 
         # Move semua tensor lain ke device
         inputs = super()._prepare_inputs(inputs)
 
         # Handle pixel_values
-        if pixel_values is not None:
-            if isinstance(pixel_values, torch.Tensor):
-                inputs["pixel_values"] = pixel_values.to(self.args.device)
-            elif isinstance(pixel_values, (list, tuple)):
-                moved = [
-                    pv.to(self.args.device) if isinstance(pv, torch.Tensor) else pv
-                    for pv in pixel_values
-                ]
-                if len(moved) == 1:
-                    # batch_size=1: unwrap list → tensor langsung
-                    inputs["pixel_values"] = moved[0]
+        if pv is not None:
+            if isinstance(pv, (list, tuple)):
+                # Unwrap atau cat
+                tensors = [p for p in pv if isinstance(p, torch.Tensor)]
+                if tensors:
+                    pv = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
                 else:
-                    # batch > 1: coba cat patches (Pixtral dynamic resolution)
-                    try:
-                        inputs["pixel_values"] = torch.cat(moved, dim=0)
-                    except RuntimeError:
-                        inputs["pixel_values"] = moved
+                    pv = None
+            if isinstance(pv, torch.Tensor):
+                # Pastikan 4D
+                if pv.dim() == 3:
+                    pv = pv.unsqueeze(0)
+                inputs["pixel_values"] = pv.to(self.args.device)
 
         # Handle image_sizes
-        if image_sizes is not None:
-            if isinstance(image_sizes, torch.Tensor):
-                inputs["image_sizes"] = image_sizes.to(self.args.device)
-            elif isinstance(image_sizes, (list, tuple)):
-                moved = [
-                    s.to(self.args.device) if isinstance(s, torch.Tensor) else s
-                    for s in image_sizes
-                ]
-                inputs["image_sizes"] = moved[0] if len(moved) == 1 else moved
+        if isz is not None:
+            if isinstance(isz, torch.Tensor):
+                inputs["image_sizes"] = isz.to(self.args.device)
+            elif isinstance(isz, (list, tuple)):
+                tensors = [s for s in isz if isinstance(s, torch.Tensor)]
+                if tensors:
+                    merged = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+                    inputs["image_sizes"] = merged.to(self.args.device)
 
         return inputs
 
@@ -70,16 +62,13 @@ def build_training_args(
     return TrainingArguments(
         output_dir=output_dir,
 
-        # Steps / epochs
         num_train_epochs = train_cfg.get("num_train_epochs", 3),
         max_steps        = train_cfg.get("max_steps", -1),
 
-        # Batch
         per_device_train_batch_size = train_cfg.get("per_device_train_batch_size", 4),
         per_device_eval_batch_size  = train_cfg.get("per_device_eval_batch_size", 4),
         gradient_accumulation_steps = train_cfg.get("gradient_accumulation_steps", 4),
 
-        # Optimizer
         learning_rate     = float(train_cfg.get("learning_rate", 2e-5)),
         warmup_ratio      = train_cfg.get("warmup_ratio", 0.05),
         lr_scheduler_type = train_cfg.get("lr_scheduler_type", "cosine"),
@@ -87,34 +76,27 @@ def build_training_args(
         weight_decay      = train_cfg.get("weight_decay", 0.01),
         max_grad_norm     = train_cfg.get("max_grad_norm", 1.0),
 
-        # Precision
         bf16 = train_cfg.get("bf16", True),
         fp16 = train_cfg.get("fp16", False),
 
-        # NEFTune
         neftune_noise_alpha = train_cfg.get("neftune_noise_alpha", 5),
 
-        # Logging
         logging_steps    = train_cfg.get("logging_steps", 10),
         logging_strategy = "steps",
 
-        # Save
         save_strategy    = train_cfg.get("save_strategy", "steps"),
         save_steps       = train_cfg.get("save_steps", 200),
         save_total_limit = train_cfg.get("save_total_limit", 3),
 
-        # Eval
         eval_strategy          = train_cfg.get("eval_strategy", "no"),
         eval_steps             = train_cfg.get("eval_steps", 200),
         load_best_model_at_end = train_cfg.get("load_best_model_at_end", True),
         metric_for_best_model  = train_cfg.get("metric_for_best_model", "eval_loss"),
         greater_is_better      = train_cfg.get("greater_is_better", False),
 
-        # DataLoader
         dataloader_num_workers = 0 if is_smoke_test else train_cfg.get("dataloader_num_workers", 4),
         dataloader_pin_memory  = not is_smoke_test,
 
-        # Misc
         report_to                     = train_cfg.get("report_to", "none"),
         remove_unused_columns         = False,
         label_names                   = ["labels"],
@@ -131,7 +113,7 @@ def build_trainer(
     collator: Any,
     training_args: TrainingArguments,
     eval_dataset: Optional[Any] = None,
-) -> Trainer:
+) -> DFKTrainer:
     logger.info("Membangun Trainer ...")
     logger.info("  Train : %d samples", len(train_dataset))
     if eval_dataset:
