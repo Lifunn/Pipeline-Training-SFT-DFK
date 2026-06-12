@@ -7,6 +7,11 @@ Usage:
     python train.py --hf_token hf_xxx
 """
 
+# Disable dynamo compilation errors — fallback ke eager mode untuk Pixtral
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.disable = True
+
 import argparse
 import logging
 import os
@@ -63,11 +68,11 @@ def preflight(cfg: dict, hf_token: str) -> None:
             logger.warning("  HF     : %s", e)
 
     data = cfg["data"]
-    for key, label in [("train_file","Train"), ("eval_file","Eval")]:
+    for key, label in [("train_file", "Train"), ("eval_file", "Eval")]:
         p = data.get(key)
         if not p:
             continue
-        full = resolve(p)
+        full   = resolve(p)
         exists = Path(full).exists()
         logger.info("  %-6s : %s %s", label, full, "✓" if exists else "✗")
         if not exists and key == "train_file":
@@ -110,14 +115,14 @@ def main():
         max_eval_samples = smoke_cfg.get("num_eval_samples", 20)
         output_dir       = smoke_cfg.get("output_dir", "./output/smoke_test")
         max_steps = smoke_cfg.get("max_steps", 5)
-
-        # Fix: save_steps dan eval_steps harus sama, load_best_model_at_end=False
         train_cfg["max_steps"]              = max_steps
         train_cfg["num_train_epochs"]       = 1
         train_cfg["save_steps"]             = max_steps
         train_cfg["eval_steps"]             = max_steps
         train_cfg["logging_steps"]          = 1
         train_cfg["load_best_model_at_end"] = False
+        train_cfg["per_device_train_batch_size"] = 1
+        train_cfg["per_device_eval_batch_size"]  = 1
     else:
         logger.info("=" * 60)
         logger.info("MODE: FULL TRAINING")
@@ -151,6 +156,7 @@ def main():
             max_seq_length=max_seq_len,
             max_samples=max_eval_samples,
         )
+        logger.info("Eval dataset: %d samples", len(eval_dataset))
     else:
         logger.info("[3/5] Eval dataset — dilewati")
 
@@ -161,10 +167,16 @@ def main():
     collator = DFKDataCollator(pad_token_id=pad_id)
 
     training_args = build_training_args(train_cfg, output_dir, is_smoke)
-    trainer = build_trainer(model, processor, train_dataset, collator, training_args, eval_dataset)
+    trainer = build_trainer(
+        model, processor, train_dataset, collator, training_args, eval_dataset
+    )
 
     # 5. Train
     logger.info("[5/5] Training ...")
+    if is_smoke:
+        logger.info("Smoke test: %d steps, %d train samples",
+                    train_cfg["max_steps"], len(train_dataset))
+
     result = trainer.train()
 
     if not is_smoke:
