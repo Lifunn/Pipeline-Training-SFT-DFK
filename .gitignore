@@ -1,0 +1,14 @@
+*.jsonl
+dataset_images/
+hf_images_folder/
+output/
+*.safetensors
+*.bin
+*.pt
+.env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.log
+wandb/
+runs/

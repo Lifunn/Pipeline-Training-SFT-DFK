@@ -1,0 +1,65 @@
+# SFT Pipeline Config — KomdigiITS-8B-DFK
+# Optimized for H200 (80GB). Untuk A100 40GB lihat komentar.
+
+model:
+  model_id: "aitf-komdigi/KomdigiITS-8B-DFK-CPT"
+  load_in_4bit: false          # H200: false | A100 40GB: true
+  dtype: "bfloat16"
+  use_gradient_checkpointing: "unsloth"
+  max_seq_length: 4096         # H200: 4096 | A100 40GB: 2048
+
+lora:
+  r: 64                        # H200: 64 | A100 40GB: 16
+  lora_alpha: 128              # selalu 2x dari r
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  lora_dropout: 0.05
+  bias: "none"
+  use_rslora: true
+  finetune_vision_layers: true # H200: true | A100 40GB: false
+  finetune_language_layers: true
+  random_state: 42
+
+data:
+  train_file: "train_final_fixed.jsonl"  # update ke absolute path di notebook
+  eval_file:  "valid_final_fixed.jsonl"  # update ke absolute path di notebook
+  image_dir:  "./dataset_images"         # update ke absolute path di notebook
+  hf_dataset_id: "aitf-its-tim3-dfk/aitf-dfk3-vlm-dataset-jsonl"
+
+training:
+  output_dir: "./output/dfk_sft"
+  num_train_epochs: 3
+  per_device_train_batch_size: 4   # H200: 4 | A100 40GB: 2
+  gradient_accumulation_steps: 4   # effective batch = 16
+  learning_rate: 2.0e-5
+  warmup_ratio: 0.05
+  lr_scheduler_type: "cosine"
+  optim: "adamw_8bit"
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  bf16: true                       # H200: true | A100 40GB: false
+  fp16: false                      # H200: false | A100 40GB: true
+  neftune_noise_alpha: 5
+  logging_steps: 10
+  save_strategy: "steps"
+  save_steps: 200
+  save_total_limit: 3
+  eval_strategy: "steps"
+  eval_steps: 200
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  dataloader_num_workers: 4
+  report_to: "none"
+
+smoke_test:
+  num_samples: 80
+  num_eval_samples: 20
+  max_steps: 5
+  output_dir: "./output/smoke_test"

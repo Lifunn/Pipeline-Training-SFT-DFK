@@ -1,0 +1,39 @@
+{%- set default_system_message = '' %}
+{{- bos_token }}
+{%- if messages[0]['role'] == 'system' %}
+    {{- '[SYSTEM_PROMPT]' -}}
+    {%- if messages[0]['content'] is string %}
+        {{- messages[0]['content'] -}}
+    {%- else %}
+        {%- for block in messages[0]['content'] %}
+            {%- if block['type'] == 'text' %}{{- block['text'] }}{%- endif %}
+        {%- endfor %}
+    {%- endif %}
+    {{- '[/SYSTEM_PROMPT]' -}}
+    {%- set loop_messages = messages[1:] %}
+{%- else %}
+    {%- set loop_messages = messages %}
+{%- endif %}
+{%- for message in loop_messages %}
+    {%- if message['role'] == 'user' %}
+        {%- if message['content'] is string %}
+            {{- '[INST]' + message['content'] + '[/INST]' }}
+        {%- else %}
+            {{- '[INST]' }}
+            {%- for block in message['content'] %}
+                {%- if block['type'] == 'text' %}{{- block['text'] }}
+                {%- elif block['type'] in ['image', 'image_url'] %}{{- '[IMG]' }}
+                {%- endif %}
+            {%- endfor %}
+            {{- '[/INST]' }}
+        {%- endif %}
+    {%- elif message['role'] == 'assistant' %}
+        {%- if message['content'] is string %}{{- message['content'] }}
+        {%- elif message['content'] is iterable %}
+            {%- for block in message['content'] %}
+                {%- if block['type'] == 'text' %}{{- block['text'] }}{%- endif %}
+            {%- endfor %}
+        {%- endif %}
+        {{- eos_token }}
+    {%- endif %}
+{%- endfor %}
