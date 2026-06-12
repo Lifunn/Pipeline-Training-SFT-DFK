@@ -7,6 +7,7 @@ Fix:
   - __getitem__ iteratif (tidak rekursif)
   - Fallback manual Mistral [INST]...[/INST]
   - Handle pixel_values list dari PixtralProcessor
+  - Fix IndexError: invalid index of a 0-dim tensor pada image_sizes
 """
 
 import json
@@ -180,22 +181,45 @@ class DFKDataset(Dataset):
 
     @staticmethod
     def _normalize_image_sizes(image_sizes: Any) -> Optional[torch.Tensor]:
+        """
+        FIX: Pastikan image_sizes selalu minimal 1D tensor [H, W].
+        PixtralProcessor kadang return scalar tensor (0-dim) yang
+        menyebabkan IndexError saat di-index dengan [0] di modeling_pixtral.py.
+        """
         if image_sizes is None:
             return None
+
         if isinstance(image_sizes, (list, tuple)):
             if len(image_sizes) == 0:
                 return None
-            if len(image_sizes) == 1:
-                image_sizes = image_sizes[0]
+            tensors = []
+            for s in image_sizes:
+                if isinstance(s, torch.Tensor):
+                    # Scalar (0-dim) → pastikan jadi minimal 1D
+                    if s.dim() == 0:
+                        s = s.unsqueeze(0)
+                    tensors.append(s)
+            if not tensors:
+                return None
+            if len(tensors) == 1:
+                image_sizes = tensors[0]
             else:
                 try:
-                    image_sizes = torch.stack(image_sizes)
+                    image_sizes = torch.stack(tensors)
                 except Exception:
-                    image_sizes = image_sizes[0]
+                    image_sizes = tensors[0]
+
         if not isinstance(image_sizes, torch.Tensor):
             return None
-        if image_sizes.dim() > 1:
+
+        # Scalar (0-dim) → 1D
+        if image_sizes.dim() == 0:
+            image_sizes = image_sizes.unsqueeze(0)
+
+        # Lebih dari 2D → squeeze dimensi pertama
+        if image_sizes.dim() > 2:
             image_sizes = image_sizes.squeeze(0)
+
         return image_sizes
 
     # ── Encoding ──────────────────────────────────────────────────────────────
@@ -324,8 +348,11 @@ class DFKDataCollator:
                     except RuntimeError:
                         batch["pixel_values"] = pv[0]
 
+        # FIX: Pastikan semua image_sizes minimal 1D sebelum stack
         isz = [f["image_sizes"] for f in features if "image_sizes" in f]
         if isz:
+            # Ensure setiap elemen minimal 1D (fix 0-dim scalar tensor)
+            isz = [s.unsqueeze(0) if s.dim() == 0 else s for s in isz]
             if len(isz) == 1:
                 batch["image_sizes"] = isz[0]
             else:
