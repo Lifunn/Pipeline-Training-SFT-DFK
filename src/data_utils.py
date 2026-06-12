@@ -5,8 +5,8 @@ Dataset dan DataCollator untuk SFT multimodal DFK.
 
 Fix:
   - __getitem__ iteratif (tidak rekursif)
-  - Fallback manual Mistral [INST]...[/INST] jika apply_chat_template gagal
-  - _dummy_sample() sebagai last resort
+  - Fallback manual Mistral [INST]...[/INST]
+  - Handle pixel_values list dari PixtralProcessor
 """
 
 import json
@@ -116,10 +116,9 @@ class DFKDataset(Dataset):
         return messages, []
 
     def _build_texts(self, messages: List[Dict]) -> Tuple[str, str]:
-        formatted    = self._to_processor_messages(messages)
+        formatted      = self._to_processor_messages(messages)
         prompt_msgs, _ = self._split_prompt(formatted)
 
-        # Attempt 1: apply_chat_template via tokenizer
         try:
             full_text   = self._tok.apply_chat_template(
                 formatted, tokenize=False, add_generation_prompt=False
@@ -131,14 +130,10 @@ class DFKDataset(Dataset):
         except Exception:
             pass
 
-        # Attempt 2: manual Mistral [INST]...[/INST] format
         return self._manual_mistral_format(messages)
 
     def _manual_mistral_format(self, messages: List[Dict]) -> Tuple[str, str]:
-        system_text = ""
-        user_text   = ""
-        asst_text   = ""
-
+        system_text = user_text = asst_text = ""
         for msg in messages:
             role = msg.get("role", "")
             text = self._content_to_text(msg.get("content", ""))
@@ -157,6 +152,52 @@ class DFKDataset(Dataset):
         prompt_text = f"{bos}[INST] {user_part} [/INST] "
         return full_text, prompt_text
 
+    # ── Pixel values helper ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_pixel_values(pixel_values: Any) -> Optional[torch.Tensor]:
+        """
+        PixtralProcessor return pixel_values sebagai list of tensors.
+        Normalize ke single tensor.
+        """
+        if pixel_values is None:
+            return None
+        if isinstance(pixel_values, (list, tuple)):
+            if len(pixel_values) == 0:
+                return None
+            if len(pixel_values) == 1:
+                pixel_values = pixel_values[0]
+            else:
+                try:
+                    pixel_values = torch.cat(pixel_values, dim=0)
+                except Exception:
+                    pixel_values = pixel_values[0]
+        if not isinstance(pixel_values, torch.Tensor):
+            return None
+        if pixel_values.dim() == 4:
+            pixel_values = pixel_values.squeeze(0)
+        return pixel_values
+
+    @staticmethod
+    def _normalize_image_sizes(image_sizes: Any) -> Optional[torch.Tensor]:
+        if image_sizes is None:
+            return None
+        if isinstance(image_sizes, (list, tuple)):
+            if len(image_sizes) == 0:
+                return None
+            if len(image_sizes) == 1:
+                image_sizes = image_sizes[0]
+            else:
+                try:
+                    image_sizes = torch.stack(image_sizes)
+                except Exception:
+                    image_sizes = image_sizes[0]
+        if not isinstance(image_sizes, torch.Tensor):
+            return None
+        if image_sizes.dim() > 1:
+            image_sizes = image_sizes.squeeze(0)
+        return image_sizes
+
     # ── Encoding ──────────────────────────────────────────────────────────────
 
     def _encode(
@@ -170,9 +211,9 @@ class DFKDataset(Dataset):
 
         has_images  = len(images) > 0
         proc_kwargs = dict(
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_seq_length,
+            return_tensors = "pt",
+            truncation     = True,
+            max_length     = self.max_seq_length,
         )
 
         try:
@@ -186,12 +227,15 @@ class DFKDataset(Dataset):
             logger.debug("Encoding failed: %s", e)
             return None
 
-        input_ids      = full_enc["input_ids"][0]
-        attention_mask = full_enc["attention_mask"][0]
-
-        labels     = input_ids.clone()
-        prompt_len = prompt_enc["input_ids"].shape[1]
-        labels[:min(prompt_len, len(labels))] = -100
+        try:
+            input_ids      = full_enc["input_ids"][0]
+            attention_mask = full_enc["attention_mask"][0]
+            labels         = input_ids.clone()
+            prompt_len     = prompt_enc["input_ids"].shape[1]
+            labels[:min(prompt_len, len(labels))] = -100
+        except Exception as e:
+            logger.debug("Label masking failed: %s", e)
+            return None
 
         result: Dict[str, torch.Tensor] = {
             "input_ids":      input_ids,
@@ -199,17 +243,14 @@ class DFKDataset(Dataset):
             "labels":         labels,
         }
 
-        pixel_values = full_enc.get("pixel_values")
-        if pixel_values is not None:
-            result["pixel_values"] = (
-                pixel_values.squeeze(0) if pixel_values.dim() == 4 else pixel_values
-            )
+        # Handle pixel_values — PixtralProcessor bisa return list
+        pv = self._normalize_pixel_values(full_enc.get("pixel_values"))
+        if pv is not None:
+            result["pixel_values"] = pv
 
-        image_sizes = full_enc.get("image_sizes")
-        if image_sizes is not None:
-            result["image_sizes"] = (
-                image_sizes.squeeze(0) if image_sizes.dim() > 1 else image_sizes
-            )
+        isz = self._normalize_image_sizes(full_enc.get("image_sizes"))
+        if isz is not None:
+            result["image_sizes"] = isz
 
         return result
 
@@ -228,7 +269,6 @@ class DFKDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # ITERATIF — tidak rekursif
         total = len(self.samples)
         for offset in range(total):
             try_idx  = (idx + offset) % total
@@ -239,7 +279,7 @@ class DFKDataset(Dataset):
             if result is not None:
                 return result
 
-        logger.error("Semua sample gagal diencode — return dummy")
+        logger.error("Semua sample gagal — return dummy")
         return self._dummy_sample()
 
 
@@ -274,17 +314,15 @@ class DFKDataCollator:
         pv = [f["pixel_values"] for f in features if "pixel_values" in f]
         if pv:
             if len(pv) == 1:
-                # batch_size=1: langsung pakai tensor tanpa tambah batch dim
                 batch["pixel_values"] = pv[0]
             else:
                 try:
                     batch["pixel_values"] = torch.stack(pv)
                 except RuntimeError:
-                    # Variable size — concat patches untuk Pixtral
                     try:
                         batch["pixel_values"] = torch.cat(pv, dim=0)
                     except RuntimeError:
-                        batch["pixel_values"] = pv
+                        batch["pixel_values"] = pv[0]
 
         isz = [f["image_sizes"] for f in features if "image_sizes" in f]
         if isz:
@@ -294,6 +332,6 @@ class DFKDataCollator:
                 try:
                     batch["image_sizes"] = torch.stack(isz)
                 except RuntimeError:
-                    batch["image_sizes"] = isz
+                    batch["image_sizes"] = isz[0]
 
         return batch
