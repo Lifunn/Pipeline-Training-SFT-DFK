@@ -2,10 +2,11 @@
 data_utils.py
 ─────────────
 Fix:
-  - Skip sample dengan valid tokens < 10 (mencegah loss NaN)
-  - pixel_values list dari PixtralProcessor di-normalize ke tensor 4D
   - __getitem__ iteratif (tidak rekursif)
   - Fallback manual Mistral [INST]...[/INST]
+  - Handle pixel_values list dari PixtralProcessor
+  - Skip sample dengan valid tokens < 10
+  - Resize gambar ke IMAGE_SIZE untuk fix batch size issue Pixtral
 """
 
 import json
@@ -19,7 +20,14 @@ from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
 
-# Minimum token assistant yang harus ada agar sample dipakai training
+# ── FIX BATCH SIZE ────────────────────────────────────────────────────────────
+# Pixtral dynamic resolution memecah gambar jadi tiles sesuai ukurannya.
+# Kalau ukuran gambar beda-beda → jumlah tiles beda → shape pixel_values beda
+# → tidak bisa di-stack jadi batch.
+# Fix: resize semua gambar ke ukuran tetap sebelum diproses.
+# 448 = 32 × 14 (kelipatan bersih patch_size Pixtral=14) → tiles selalu sama.
+IMAGE_SIZE = (448, 448)
+
 MIN_VALID_TOKENS = 10
 
 
@@ -71,7 +79,9 @@ class DFKDataset(Dataset):
                 full = self.image_dir / rel
                 if full.exists():
                     try:
-                        images.append(Image.open(full).convert("RGB"))
+                        img = Image.open(full).convert("RGB")
+                        img = img.resize(IMAGE_SIZE, Image.LANCZOS)  # ← FIX BATCH SIZE
+                        images.append(img)
                     except Exception as e:
                         logger.debug("Cannot open image %s: %s", full, e)
         return images
@@ -156,7 +166,7 @@ class DFKDataset(Dataset):
     @staticmethod
     def _normalize_pixel_values(pixel_values: Any) -> Optional[torch.Tensor]:
         """
-        Normalize pixel_values ke 4D tensor [tiles/batch, C, H, W].
+        Normalize pixel_values ke 4D tensor [tiles, C, H, W].
         PixtralProcessor return list of tensors untuk dynamic resolution.
         PENTING: Tidak pernah squeeze ke 3D.
         """
@@ -183,11 +193,10 @@ class DFKDataset(Dataset):
         if not isinstance(pixel_values, torch.Tensor):
             return None
 
-        # Pastikan 4D — JANGAN squeeze ke 3D
         if pixel_values.dim() == 3:
-            pixel_values = pixel_values.unsqueeze(0)   # [C,H,W] → [1,C,H,W]
+            pixel_values = pixel_values.unsqueeze(0)
         elif pixel_values.dim() == 5:
-            pixel_values = pixel_values.squeeze(0)     # [1,t,C,H,W] → [t,C,H,W]
+            pixel_values = pixel_values.squeeze(0)
 
         return pixel_values
 
@@ -266,13 +275,11 @@ class DFKDataset(Dataset):
             logger.debug("Label masking failed: %s", e)
             return None
 
-        # ── FIX UTAMA: Skip sample dengan valid tokens terlalu sedikit ────────
-        # Terjadi ketika teks terlalu panjang sehingga assistant response
-        # terpotong oleh max_seq_length — semua labels = -100, loss = NaN
+        # Skip sample yang assistant response-nya terpotong
         valid_tokens = (labels != -100).sum().item()
         if valid_tokens < MIN_VALID_TOKENS:
             logger.debug(
-                "Skip sample: valid tokens=%d < %d (teks terlalu panjang/terpotong)",
+                "Skip sample: valid tokens=%d < %d",
                 valid_tokens, MIN_VALID_TOKENS
             )
             return None
@@ -353,7 +360,6 @@ class DFKDataCollator:
             "labels":         torch.stack(lbl_list),
         }
 
-        # pixel_values: cat along dim=0 (tiles/batch dim)
         pv = [f["pixel_values"] for f in features if "pixel_values" in f]
         if pv:
             if len(pv) == 1:
@@ -364,7 +370,6 @@ class DFKDataCollator:
                 except RuntimeError:
                     batch["pixel_values"] = pv[0]
 
-        # image_sizes: cat along dim=0
         isz = [f["image_sizes"] for f in features if "image_sizes" in f]
         if isz:
             if len(isz) == 1:
